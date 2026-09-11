@@ -1,0 +1,221 @@
+---
+title: "Twitter Analyses"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-expand: 1
+    toc-title: Contents
+    toc-location: left
+editor: visual
+execute:
+  freeze: auto
+  echo: true
+  message: false
+  warning: false
+---
+
+# Load Libraries
+
+```{r}
+library(tidyverse)
+library(data.table)
+library(fixest)
+library(knitr)
+library(broom)
+library(scales)
+library(nnet)
+library(parameters)
+library(flextable)
+library(marginaleffects)
+```
+
+# Load Data
+
+```{r}
+data = fread(
+  'twitter_data.csv',
+  showProgress = TRUE)
+
+kable(head(data), digits = 2, format = "markdown")
+```
+
+# Prepare Data
+
+## Calibrate Model Probabilities
+
+```{r}
+cal_villain = readRDS(
+  'villain_probability_calibration.rds'
+)
+cal_victim  = readRDS(
+  'victim_probability_calibration.rds'
+)
+
+eps = 1e-4
+data[, lp_villain := qlogis(pmin(pmax(villain_prob, eps), 1 - eps))]
+data[, lp_victim  := qlogis(pmin(pmax(victim_prob,  eps), 1 - eps))]
+
+data[, p_villain_cal := predict(cal_villain,
+                                newdata = data.frame(lp = lp_villain, pc1 = pc1),
+                                type = "response")]
+data[, p_victim_cal := predict(cal_victim,
+                               newdata = data.frame(lp = lp_victim, pc1 = pc1),
+                               type = "response")]
+```
+
+## Code Moral Dyad Variables
+
+```{r}
+data[, `:=`(
+  villain_pred_cal = as.integer(p_villain_cal > 0.5),
+  victim_pred_cal  = as.integer(p_victim_cal > 0.5),
+  dyad_binary_cal  = as.integer(p_villain_cal > 0.5 & p_victim_cal > 0.5)
+)]
+data[, moral_agent_cal := fcase(
+  villain_pred_cal == 1 & victim_pred_cal == 1, "dyad",
+  villain_pred_cal == 1 & victim_pred_cal == 0, "villain_only",
+  villain_pred_cal == 0 & victim_pred_cal == 1, "victim_only",
+  default = "neither"
+)]
+data[, moral_agent_cal := factor(moral_agent_cal,
+                                 levels = c("neither", "dyad",
+                                            "villain_only", "victim_only"))]
+```
+
+## Code Engagement Variables
+
+```{r}
+# calculate summed engagement
+data[, engagement := like_count + retweet_count]
+
+# standardized index: z-score each metric, then sum 
+data[, eng_index := scale(like_count)[, 1] + scale(retweet_count)[, 1]]
+```
+
+## Code Source Quality
+
+```{r}
+# reverse code source quality: 0 = highest quality, 1 = lowest
+data[, pc1_reversed := 1 - pc1]
+```
+
+# Descriptives
+
+```{r}
+desc = data[, .(
+  n = .N,
+  villain_rate = mean(villain_pred_cal),
+  victim_rate = mean(victim_pred_cal),
+  dyad_rate = mean(dyad_binary_cal),
+  either_rate = mean(villain_pred_cal == 1 | victim_pred_cal == 1)
+)]
+kable(desc, digits = 4)
+
+agent_props = data[, .N, by = moral_agent_cal][, prop := N / sum(N)][]
+kable(agent_props, digits = 4)
+```
+
+# Analyses
+
+## Hypothesis 1
+
+```{r}
+h1_mod = multinom(
+  moral_agent_cal ~
+    pc1_reversed,
+  data = data
+)
+```
+
+```{r}
+h1_res_table = model_parameters(h1_mod, exponentiate = TRUE) %>% kable(digits = 3, format = "markdown")
+```
+
+```{r}
+h1_res_table
+```
+
+```{r}
+# average risk difference
+knitr::kable(
+  avg_comparisons(h1_mod,
+                  variables = list(pc1_reversed = c(0, 1))) %>%
+  as_tibble(),
+  digits = 2)
+```
+
+## Hypothesis 2
+
+```{r}
+h2_likes      = fenegbin(like_count ~ moral_agent_cal, data = data)
+h2_retweets = fenegbin(retweet_count ~ moral_agent_cal, data = data)
+h2_sum        = fenegbin(engagement ~ moral_agent_cal, data = data)
+h2_index      = feols(eng_index ~ moral_agent_cal, data = data)
+```
+
+```{r}
+h2_tbl = bind_rows(
+  tidy(h2_likes, conf.int = TRUE) %>% mutate(outcome = "Likes (NB)"),
+  tidy(h2_retweets, conf.int = TRUE) %>% mutate(outcome = "Retweets (NB)"),
+  tidy(h2_sum, conf.int = TRUE) %>% mutate(outcome = "Summed (NB)"),
+  tidy(h2_index, conf.int = TRUE) %>% mutate(outcome = "Z-index (OLS)")
+) %>%
+  filter(str_starts(term, "moral_agent_cal")) %>%
+  mutate(contrast = str_remove(term, "moral_agent_cal")) %>%
+  # exponentiate NB rows to IRRs and leave the OLS row on the raw scale
+  mutate(across(c(estimate, conf.low, conf.high),
+                ~ if_else(outcome == "Z-index (OLS)", .x, exp(.x)))) %>%
+  dplyr::select(outcome, contrast, estimate, conf.low, conf.high, statistic, p.value)
+
+kable(h2_tbl, digits = 4,
+      caption = "H2 Results")
+```
+
+```{r}
+predict_dyad_vs_neither = function(mod, platform, outcome,
+                                   term = "moral_agent_caldyad",
+                                   invlink = exp, file = NULL) {
+  b = coef(mod); V = vcov(mod)
+  stopifnot("(Intercept)" %in% names(b), term %in% names(b))
+  keep = c("(Intercept)", term)
+  L = rbind(Neither = c(1, 0), Dyad = c(1, 1))
+  eta = as.vector(L %*% b[keep])
+  se  = sqrt(diag(L %*% V[keep, keep] %*% t(L)))
+  out = tibble(platform = platform, outcome = outcome,
+               group = rownames(L),
+               predicted = invlink(eta),
+               conf.low  = invlink(eta - 1.96 * se),
+               conf.high = invlink(eta + 1.96 * se))
+  if (!is.null(file)) readr::write_csv(out, file)
+  out
+}
+```
+
+```{r}
+predict_dyad_vs_neither(h2_sum, "Twitter", "summed engagement",
+                        file = "pred_engagement_twitter.csv")
+```
+
+### Outrage
+
+```{r}
+h2_outrage = feglm(outrage ~ moral_agent_cal,
+                   data = data, family = binomial())
+```
+
+```{r}
+kable(tidy(h2_outrage, conf.int = TRUE) %>%
+  mutate(across(c(estimate, conf.low, conf.high), exp)), digits = 2)
+```
+
+```{r}
+predict_dyad_vs_neither(h2_outrage, "Twitter", "P(outrage)",
+                        invlink = plogis, file = "pred_outrage_twitter.csv")
+```
+
+# Session Info
+
+```{r}
+sessionInfo()
+```

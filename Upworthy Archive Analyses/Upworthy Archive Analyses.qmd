@@ -1,0 +1,210 @@
+---
+title: "Upworthy Archive Analyses"
+format: 
+  html:
+    toc: true
+    toc-depth: 3
+    toc-expand: 1
+    toc-title: Contents
+    toc-location: left
+editor: visual
+execute:
+  freeze: auto
+  echo: true
+  message: false
+  warning: false
+---
+
+# Load Libraries
+
+```{r}
+library(tidyverse)
+library(knitr)
+library(fixest)       
+library(broom)
+library(broom.mixed)
+library(scales)
+```
+
+# Load Data
+
+```{r}
+datafile = "upworthy_archive_data.csv"
+
+data = read_csv(datafile, show_col_types = FALSE)
+
+kable(head(data), digits = 2, format = "markdown")
+```
+
+# Prepare Data
+
+## Exclusions
+
+```{r}
+# remove A/B tests where no headline variant recieved any clicks and remove tests that have only one headline variant
+n_raw = nrow(data)
+t_raw = n_distinct(data$clickability_test_id)
+
+data = data %>%
+  group_by(clickability_test_id) %>%
+  filter(sum(clicks, na.rm = TRUE) > 0, n() > 1) %>%
+  ungroup()
+
+cat("Dropped", n_raw - nrow(data), "of", n_raw, "variants and",
+    t_raw - n_distinct(data$clickability_test_id), "of", t_raw, "tests\n")
+```
+
+## Data Types and Levels
+
+```{r}
+# ensure data types are correct and set levels
+data = data %>%
+  mutate(
+    # factor the A/B test set ID variable
+    clickability_test_id = factor(clickability_test_id),
+    # factor the villain and victim predictions
+    villain_pred = factor(villain_pred, levels = c(0, 1)),
+    victim_pred  = factor(victim_pred,  levels = c(0, 1))
+  )
+
+# create the moral agent variable
+data = data %>%
+  mutate(
+    moral_agent = factor(
+      case_when(
+        villain_pred == 1 & victim_pred == 1 ~ "dyad",
+        villain_pred == 1 & victim_pred == 0 ~ "villain_only",
+        villain_pred == 0 & victim_pred == 1 ~ "victim_only",
+        TRUE                                 ~ "neither"
+      ),
+      levels = c("neither", "dyad", "villain_only", "victim_only")
+    )
+  )
+```
+
+# Descriptives
+
+```{r}
+agent_props = data %>%
+  count(moral_agent) %>%
+  mutate(proportion = n / sum(n))
+
+kable(agent_props, digits = 2)
+```
+
+```{r}
+variation_summary = data %>%
+  group_by(clickability_test_id) %>%
+  summarise(
+    agent_mixed = n_distinct(moral_agent) > 1,
+    .groups = "drop"
+  ) %>%
+  summarise(
+    n_tests            = n(),
+    n_agent_mixed      = sum(agent_mixed)
+  )
+
+kable(variation_summary, digits = 2)
+```
+
+# **Dyadic moral framing increases engagement**
+
+```{r}
+m_agent = fepois(
+  clicks ~
+    moral_agent | clickability_test_id,
+  offset = ~ log(impressions),
+  data   = data,
+  vcov   = "cluster"
+)
+```
+
+```{r}
+broom::tidy(
+  m_agent,
+  conf.int = TRUE) %>%
+  mutate(across(c(estimate, conf.low, conf.high), exp)) %>%
+  kable(digits = 4)
+```
+
+```{r}
+# pairwise irr contrasts
+b = coef(m_agent)
+V = vcov(m_agent)
+
+terms = c(Neither = NA, Dyad = "moral_agentdyad",
+          `Villain only` = "moral_agentvillain_only",
+          `Victim only`  = "moral_agentvictim_only")
+
+pairs_list = combn(names(terms), 2, simplify = FALSE)
+
+fe_contrasts = map_dfr(pairs_list, function(p) {
+  cv = setNames(rep(0, length(b)), names(b))
+  if (!is.na(terms[p[1]])) cv[terms[p[1]]] = 1
+  if (!is.na(terms[p[2]])) cv[terms[p[2]]] = -1
+  est = sum(cv * b)
+  se  = sqrt(t(cv) %*% V %*% cv)[1, 1]
+  tibble(contrast = paste(p[1], "/", p[2]),
+         ratio = exp(est),
+         conf.low = exp(est - 1.96 * se),
+         conf.high = exp(est + 1.96 * se),
+         z = est / se,
+         p.value = 2 * pnorm(-abs(est / se)))
+})
+
+kable(fe_contrasts, digits = 2)
+```
+
+# Figure 5
+
+```{r}
+custom_colors = c(
+  "Neither"      = "#EDEEC9",
+  "Villain only" = "#B20D30",
+  "Victim only"  = "#00B4D8",
+  "Dyad"         = "#DF57BC"
+)
+
+agent_irr = broom::tidy(m_agent, conf.int = TRUE) %>%
+  mutate(across(c(estimate, conf.low, conf.high), exp))
+
+agent_irr_plot = agent_irr %>%
+  mutate(term = recode(term,
+                       "moral_agentdyad"         = "Dyad",
+                       "moral_agentvillain_only" = "Villain only",
+                       "moral_agentvictim_only"  = "Victim only")) %>%
+  ggplot(aes(estimate, term, color = term)) +
+  geom_vline(xintercept = 1, linetype = 2) +
+  geom_point(size = 4) +
+  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high), height = .12, width = 0.1, linewidth = 2) +
+  labs(x = "Incidence Rate Ratio", y = NULL) +
+  scale_color_manual(values = custom_colors) +
+  theme_classic(base_size = 14) +
+  theme(
+    legend.position = "none",
+    axis.title = element_text(size = 18),
+    axis.text = element_text(size = 16),
+    panel.background = element_rect(fill = "transparent", color = NA),
+    plot.background = element_rect(fill = "transparent", color = NA)
+    )
+
+ggsave(
+  filename = "agent_model_contrasts_plot.png",
+  plot = agent_irr_plot,
+  width = 6, height = 4,
+  bg = "transparent")
+
+ggsave(
+  filename = "agent_model_contrasts_plot.svg",
+  plot = agent_irr_plot,
+  width = 6, height = 4,
+  bg = "transparent")
+
+agent_irr_plot
+```
+
+# Session Information
+
+```{r}
+sessionInfo()
+```

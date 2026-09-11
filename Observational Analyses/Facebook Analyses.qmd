@@ -1,0 +1,148 @@
+---
+title: "Facebook Analyses"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-expand: 1
+    toc-title: Contents
+    toc-location: left
+editor: visual
+execute:
+  freeze: auto
+  echo: true
+  message: false
+  warning: false
+---
+
+# Load Libraries
+
+```{r}
+library(tidyverse)
+library(data.table)
+library(fixest)
+library(knitr)
+library(broom)
+library(scales)
+library(nnet)
+library(parameters)
+```
+
+# Load Data
+
+```{r}
+data = fread(
+  'facebook_data.csv',
+  showProgress = TRUE
+  )
+
+cat("Rows:", format(nrow(data), big.mark = ","), "\n")
+```
+
+```{r}
+kable(head(data), digits = 2, format = "markdown")
+```
+
+# Prepare Data
+
+## Code Year Variable
+
+```{r}
+data[, year := as.factor(year)]
+```
+
+## Calibrate Model Probabilities
+
+```{r}
+cal_villain = readRDS(
+  '/Users/km0353/Desktop/Scripts/Fine Tuning/villain_probability_calibration.rds'
+)
+cal_victim  = readRDS(
+  '/Users/km0353/Desktop/Scripts/Fine Tuning/victim_probability_calibration.rds'
+)
+
+eps = 1e-4
+data[, lp_villain := qlogis(pmin(pmax(villain_prob, eps), 1 - eps))]
+data[, lp_victim  := qlogis(pmin(pmax(victim_prob,  eps), 1 - eps))]
+
+data[, p_villain_cal := predict(cal_villain,
+                                newdata = data.frame(lp = lp_villain, pc1 = pc1),
+                                type = "response")]
+data[, p_victim_cal := predict(cal_victim,
+                               newdata = data.frame(lp = lp_victim, pc1 = pc1),
+                               type = "response")]
+```
+
+## Code the Moral Agent Variable
+
+```{r}
+data[, `:=`(
+  villain_pred_cal = as.integer(p_villain_cal > 0.5),
+  victim_pred_cal  = as.integer(p_victim_cal > 0.5),
+  dyad_binary_cal  = as.integer(p_villain_cal > 0.5 & p_victim_cal > 0.5)
+)]
+data[, moral_agent_cal := fcase(
+  villain_pred_cal == 1 & victim_pred_cal == 1, "dyad",
+  villain_pred_cal == 1 & victim_pred_cal == 0, "villain_only",
+  villain_pred_cal == 0 & victim_pred_cal == 1, "victim_only",
+  default = "neither"
+)]
+data[, moral_agent_cal := factor(moral_agent_cal,
+                                 levels = c("neither", "dyad",
+                                            "villain_only", "victim_only"))]
+```
+
+## Code Source Quality
+
+```{r}
+# reverse code source quality: 0 = highest quality, 1 = lowest
+data[, pc1_reversed := 1 - pc1]
+```
+
+# Descriptives
+
+```{r}
+desc = data[, .(
+  n = .N,
+  villain_rate = mean(villain_pred_cal),
+  victim_rate = mean(victim_pred_cal),
+  dyad_rate = mean(dyad_binary_cal),
+  either_rate = mean(villain_pred_cal == 1 | victim_pred_cal == 1)
+)]
+kable(desc, digits = 4)
+
+agent_props = data[, .N, by = moral_agent_cal][, prop := N / sum(N)][]
+kable(agent_props, digits = 4)
+```
+
+# Analyses
+
+## Hypothesis 1
+
+```{r}
+h1_mod = multinom(
+  moral_agent_cal ~
+    pc1_reversed + year,
+  data = data
+)
+```
+
+```{r}
+h1_res_table = model_parameters(h1_mod, exponentiate = TRUE) %>% kable(digits = 3, format = "markdown")
+```
+
+```{r}
+h1_res_table
+```
+
+```{r}
+avg_comparisons(h1_mod,
+                variables = list(pc1_reversed = c(0, 1))) %>%
+  as_tibble()
+```
+
+# Session Info
+
+```{r}
+sessionInfo()
+```

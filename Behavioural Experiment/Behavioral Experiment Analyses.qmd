@@ -1,0 +1,637 @@
+---
+title: "Behavioral Experiment Analyses"
+format: 
+  html:
+    toc: true
+    toc-depth: 3
+    toc-expand: 1
+    toc-title: Contents
+    toc-location: left
+editor: visual
+execute:
+  freeze: auto
+  echo: true
+  message: false
+  warning: false
+---
+
+# Load Libraries
+
+```{r}
+library(tidyverse)
+library(knitr)
+library(psych)
+library(lmerTest) 
+library(marginaleffects)
+library(ordinal) 
+library(emmeans)
+```
+
+# Load Data
+
+## Participant-Level Data
+
+```{r}
+p_data = read_csv("participant_level_data.csv", show_col_types = FALSE)
+
+kable(head(p_data), digits = 2, format = "markdown")
+```
+
+## Headline-Level Data
+
+```{r}
+head_data = read_csv("headline_level_data.csv", show_col_types = FALSE)
+
+kable(head(head_data), digits = 2, format = "markdown")
+```
+
+# Annotator Agreement
+
+## Annotators per Headline
+
+```{r}
+block_n = p_data |>
+  distinct(wave, block, participant_id) |>
+  count(wave, block, name = "n_participants")
+
+knitr::kable(
+  block_n |>
+    summarise(
+      `N blocks` = n(),
+      `Mean annotators`    = mean(n_participants),
+      SD       = sd(n_participants),
+      Min      = min(n_participants),
+      Max      = max(n_participants)
+  ), digits = 2)
+```
+
+## Define Function
+
+```{r}
+# function to compute ICCs for a single block
+compute_icc_per_block = function(block_data, rating_var) {
+  wide_data = block_data %>%
+    select(headline, participant_id, all_of(rating_var)) %>%
+    pivot_wider(names_from = participant_id, values_from = all_of(rating_var))
+  # convert to a matrix, excluding headline information
+  rating_matrix = as.matrix(select(wide_data, -headline))
+  # compute ICC, handle cases with too few raters
+  icc_out = psych::ICC(rating_matrix)
+  return(icc_out)
+}
+```
+
+## Prepare Data
+
+```{r}
+# filter for clear headlines
+# ensure villain and victim annotations are numeric
+# create an identifier for each wave-block pair
+p_data_agree = p_data %>%
+  filter(clarity_binary == 1) %>%
+  mutate(
+    villain_presence_ordinal = as.numeric(villain_presence_ordinal),
+    victim_presence_ordinal = as.numeric(victim_presence_ordinal),
+    wave_block = paste0("W", wave, "_B", block)  # e.g., W1_B1, W2_B1
+  )
+```
+
+```{r}
+blocks = p_data_agree |>
+  group_by(wave_block) |>
+  group_split()
+
+names(blocks) = p_data_agree |>
+  group_by(wave_block) |>
+  group_keys() |>
+  pull(wave_block) |>
+  as.character()
+```
+
+## Calculate
+
+### Villain Ratings
+
+```{r}
+icc_villain = lapply(blocks, compute_icc_per_block,
+                     rating_var = "villain_presence_ordinal")
+```
+
+```{r}
+icc2k_list = list()
+
+for (i in seq_along(icc_villain)) {
+  
+  icc = icc_villain[[i]]
+  block_name = paste0("Block_", i)
+  res = icc$results
+  row = res["Average_random_raters", c("type", "ICC", "lower bound", "upper bound", "p")]
+  icc2k_list[[i]] = data.frame(
+    wave_block = block_name,
+    type = row[["type"]],
+    ICC2k = as.numeric(row[["ICC"]]),
+    ICC2k_lower = as.numeric(row[["lower bound"]]),
+    ICC2k_upper = as.numeric(row[["upper bound"]]),
+    p = as.numeric(row[["p"]])
+  )
+}
+
+# combine into a single dataframe
+icc_summary = do.call(rbind, icc2k_list)
+
+knitr::kable(icc_summary, digits = 2)
+```
+
+```{r}
+round(mean(icc_summary$ICC2k), 2)
+```
+
+### Victim Ratings
+
+```{r}
+icc_victim  = lapply(blocks, compute_icc_per_block,
+                     rating_var = "victim_presence_ordinal")
+```
+
+```{r}
+icc2k_list = list()
+
+for (i in seq_along(icc_victim)) {
+  
+  icc = icc_victim[[i]]
+  block_name = paste0("Block_", i)
+  res = icc$results
+  row = res["Average_random_raters", c("type", "ICC", "lower bound", "upper bound", "p")]
+  icc2k_list[[i]] = data.frame(
+    wave_block = block_name,
+    type = row[["type"]],
+    ICC2k = as.numeric(row[["ICC"]]),
+    ICC2k_lower = as.numeric(row[["lower bound"]]),
+    ICC2k_upper = as.numeric(row[["upper bound"]]),
+    p = as.numeric(row[["p"]])
+  )
+}
+
+# combine into a single dataframe
+icc_summary = do.call(rbind, icc2k_list)
+
+knitr::kable(icc_summary, digits = 2)
+```
+
+```{r}
+round(mean(icc_summary$ICC2k), 2)
+```
+
+# **Low-Quality News Sources are More Likely to Portray Villains and Victims**
+
+## Prepare Data
+
+### Participant-Level Data
+
+```{r}
+# code data types
+p_data = p_data |>
+  mutate(
+    participant_id = as.factor(participant_id),
+    headline_id    = as.factor(headline_id),
+    gender         = as.factor(gender),
+    party_id       = relevel(as.factor(party_id), ref = "independent"),
+    across(c(ideology_ordinal, ladder_response, age, education_ordinal,
+             wellbeing_ordinal, poli_trust_ordinal, moral_essentialism,
+             affective_polarization, income), as.numeric),
+    across(c(villain_presence_ordinal, victim_presence_ordinal),
+           \(x) factor(x, ordered = TRUE))
+  )
+
+# code dyad variables
+p_data = p_data |>
+  mutate(
+    villain_presence_binary = as.integer(villain_presence_binary),
+    victim_presence_binary  = as.integer(victim_presence_binary),
+    dyad_binary  = as.integer(villain_presence_binary == 1 &
+                                victim_presence_binary  == 1),
+    pc1_reversed = 1 - pc1,          # 0 = highest quality, 1 = lowest
+    income_10k   = income / 10000,
+    age_decade   = age / 10
+  )
+
+# subset on clear headlines
+p_data_clear = p_data |> filter(clarity_binary == 1)
+
+# grand-mean center covariates
+covars_num = c("affective_polarization", "poli_trust_ordinal", "ideology_ordinal",
+                "age_decade", "ladder_response", "income_10k",
+                "education_ordinal", "moral_essentialism", "wellbeing_ordinal")
+covars_all = c(covars_num, "gender", "party_id")
+
+p_means = p_data_clear |>
+  filter(complete.cases(pick(all_of(covars_all)))) |>
+  distinct(participant_id, .keep_all = TRUE) |>
+  summarise(across(all_of(covars_num), \(x) mean(x, na.rm = TRUE)))
+
+p_data_clear = p_data_clear |>
+  mutate(across(all_of(covars_num),
+                \(x) x - p_means[[cur_column()]],
+                .names = "{.col}_c"))
+```
+
+```{r}
+# compute Ns
+n_distinct(p_data_clear$headline_id)   
+```
+
+### Headline-Level Data
+
+```{r}
+head_data = head_data |>
+  mutate(
+    # code villains, victims, and the dyad
+    villain_binary = as.integer(villain_presence_majority),
+    victim_binary  = as.integer(victim_presence_majority),
+    dyad_binary    = as.integer(villain_binary == 1 & victim_binary == 1),
+    # reverse code source quality
+    pc1_reversed = 1 - pc1
+  )
+```
+
+```{r}
+# subset on headlines rated as clear
+head_data_clear = head_data %>%
+  filter(clarity_majority == 1)
+
+n_distinct(head_data_clear$headline_id)
+```
+
+## Analyses
+
+### Participant-Level
+
+#### Dyad \~ Source Quality
+
+```{r}
+m_dyad = glmer(
+  dyad_binary ~
+    pc1_reversed + 
+    affective_polarization_c + poli_trust_ordinal_c + ideology_ordinal_c + party_id + 
+    age_decade_c + gender + ladder_response_c + income_10k_c + education_ordinal_c +
+    moral_essentialism_c + wellbeing_ordinal_c +
+    (1 | participant_id) + (1 | headline_id),
+  data    = p_data_clear,
+  family  = binomial,
+  control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5))
+)
+```
+
+```{r}
+kable(broom.mixed::tidy(
+  m_dyad,
+  effects = "fixed",
+  conf.int = TRUE,
+  exponentiate = TRUE,
+  conf.method = "Wald"),
+  digits = 4)
+```
+
+```{r}
+# risk difference across the full source-quality range
+avg_comparisons(m_dyad,
+                variables = list(pc1_reversed = c(0, 1)),
+                re.form = NA)
+```
+
+```{r}
+# missingness
+covars = c("affective_polarization", "poli_trust_ordinal", "ideology_ordinal",
+           "party_id", "age_decade", "gender", "ladder_response", "income_10k",
+           "education_ordinal", "moral_essentialism", "wellbeing_ordinal")
+
+p_data_clear |>
+  distinct(participant_id, .keep_all = TRUE) |>
+  summarise(across(all_of(covars), ~ sum(is.na(.)))) |>
+  tidyr::pivot_longer(everything(), names_to = "Covariate", values_to = "N Missing") |>
+  arrange(desc(`N Missing`)) |>
+  mutate(
+    Covariate = recode(Covariate,
+                  "poli_trust_ordinal" = "Political trust",
+                  "party_id" = "Political party",
+                  "wellbeing_ordinal" = "Wellbeing",
+                  "gender" = "Gender",
+                  "education_ordinal" = "Education",
+                  "income_10k" = "Income",
+                  "affective_polarization" = "Affective polarization",
+                  "ideology_ordinal" = "Political ideology",
+                  "age_decade" = "Age",
+                  "ladder_response" = "Subjective SES"
+    )
+  )
+```
+
+#### Villain \~ Source Quality
+
+```{r}
+m_villain = clmm(
+  villain_presence_ordinal ~
+    pc1_reversed + 
+    affective_polarization_c + poli_trust_ordinal_c + ideology_ordinal_c + party_id + 
+    age_decade_c + gender + ladder_response_c + income_10k_c + education_ordinal_c +
+    moral_essentialism_c + wellbeing_ordinal_c +
+    (1 + pc1_reversed | participant_id) + (1 | headline_id),
+  data    = p_data_clear
+)
+```
+
+```{r}
+kable(broom.mixed::tidy(
+  m_villain,
+  conf.int = TRUE,
+  exponentiate = TRUE), # exponentiate the results to odds ratios
+  digits = 4)
+```
+
+```{r}
+em = emmeans(m_villain, ~ pc1_reversed | villain_presence_ordinal,
+              at = list(pc1_reversed = c(0, 1)), mode = "prob")
+em
+contrast(em, method = "revpairwise")
+```
+
+#### Victim \~ Source Quality
+
+```{r}
+m_victim = clmm(
+  victim_presence_ordinal ~
+    pc1_reversed + 
+    affective_polarization_c + poli_trust_ordinal_c + ideology_ordinal_c + party_id + 
+    age_decade_c + gender + ladder_response_c + income_10k_c + education_ordinal_c +
+    moral_essentialism_c + wellbeing_ordinal_c +
+    (1 + pc1_reversed | participant_id) + (1 | headline_id),
+  data    = p_data_clear
+)
+```
+
+```{r}
+kable(broom.mixed::tidy(
+  m_victim,
+  conf.int = TRUE,
+  exponentiate = TRUE), # exponentiate the results to odds ratios
+  digits = 4)
+```
+
+```{r}
+em = emmeans(m_victim, ~ pc1_reversed | victim_presence_ordinal,
+              at = list(pc1_reversed = c(0, 1)), mode = "prob")
+em
+contrast(em, method = "revpairwise")
+```
+
+### Headline-Level
+
+#### Dyad \~ Source Quality
+
+```{r}
+m_dyad_head = glmer(
+  dyad_binary ~
+    pc1_reversed +
+    (1 | domain),
+  data    = head_data_clear,
+  family  = binomial,
+  control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5))
+)
+```
+
+```{r}
+kable(broom.mixed::tidy(
+  m_dyad_head,
+  effects = "fixed",
+  conf.int = TRUE,
+  exponentiate = TRUE,
+  conf.method = "Wald"),
+  digits = 4)
+```
+
+#### Villain \~ Source Quality
+
+```{r}
+m_villain_head = glmer(
+  villain_binary ~
+    pc1_reversed +
+    (1 | domain),
+  data    = head_data_clear,
+  family  = binomial,
+  control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5))
+)
+```
+
+```{r}
+kable(broom.mixed::tidy(
+  m_villain_head,
+  effects = "fixed",
+  conf.int = TRUE,
+  exponentiate = TRUE,
+  conf.method = "Wald"),
+  digits = 4)
+```
+
+#### Victim \~ Source Quality
+
+```{r}
+m_victim_head = glmer(
+  victim_binary ~
+    pc1_reversed +
+    (1 | domain),
+  data    = head_data_clear,
+  family  = binomial,
+  control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5))
+)
+```
+
+```{r}
+kable(broom.mixed::tidy(
+  m_victim_head,
+  effects = "fixed",
+  conf.int = TRUE,
+  exponentiate = TRUE,
+  conf.method = "Wald"),
+  digits = 4)
+```
+
+### Robustness Analyses
+
+Participant-level focal predictor models including all participants.
+
+#### Dyad \~ Source Quality
+
+```{r}
+m_dyad_incl = glmer(
+  dyad_binary ~
+    pc1_reversed +
+    (1 | participant_id) + (1 | headline_id),
+  data    = p_data_clear,
+  family  = binomial,
+  control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5))
+)
+```
+
+```{r}
+kable(broom.mixed::tidy(
+  m_dyad_incl,
+  effects = "fixed",
+  conf.int = TRUE,
+  exponentiate = TRUE,
+  conf.method = "Wald"),
+  digits = 4)
+```
+
+#### Villain \~ Source Quality
+
+```{r}
+m_villain_incl = clmm(
+  villain_presence_ordinal ~
+    pc1_reversed +
+    (1 + pc1_reversed | participant_id) + (1 | headline_id),
+  data    = p_data_clear
+)
+```
+
+```{r}
+kable(broom.mixed::tidy(
+  m_villain_incl,
+  conf.int = TRUE,
+  exponentiate = TRUE), # exponentiate the results to odds ratios
+  digits = 4)
+```
+
+#### Victim \~ Source Quality
+
+```{r}
+m_victim_incl = clmm(
+  victim_presence_ordinal ~
+    pc1_reversed + 
+    (1 + pc1_reversed | participant_id) + (1 | headline_id),
+  data    = p_data_clear
+)
+```
+
+```{r}
+kable(broom.mixed::tidy(
+  m_victim_incl,
+  conf.int = TRUE,
+  exponentiate = TRUE), # exponentiate the results to odds ratios
+  digits = 4)
+```
+
+# **Dyadic Completion Helps Explain the Relative ‘Success’ of Villains**
+
+## Prepare Data
+
+```{r}
+p_data_comp = p_data %>%
+  # remove unclear headlines
+  filter(clarity_binary == 1) %>%
+  # clean free text fields
+  mutate(
+    # remove any whitespaces at the start or end and make all text lowercase
+    victim_text_clean = str_trim(str_to_lower(victim_identity)),
+    villain_text_clean = str_trim(str_to_lower(villain_identity)),
+    # remove, nulls, blanks, and 'none'
+    victim_text_clean = ifelse(
+      victim_text_clean == "" |
+        is.na(victim_text_clean) |
+        str_detect(victim_text_clean, "^none$|^no$|^n/a$|^nil$"),
+      NA, victim_text_clean
+    ),
+    villain_text_clean = ifelse(
+      villain_text_clean == "" |
+        is.na(villain_text_clean) |
+        str_detect(villain_text_clean, "^none$|^no$|^n/a$|^nil$"),
+      NA, villain_text_clean
+    )
+  ) %>%
+  # binary indicators of whether an entity was named
+  mutate(
+    named_victim  = ifelse(is.na(victim_text_clean), 0, 1),
+    named_villain = ifelse(is.na(villain_text_clean), 0, 1),
+    # binary victim and villain presense on the likert measures presence 
+    victim_present_bin  = ifelse(victim_presence_ordinal >= 4, 1, 0),
+    villain_present_bin = ifelse(villain_presence_ordinal >= 4, 1, 0)
+  )
+```
+
+```{r}
+# aggregate to the headline level
+head_data_comp = p_data_comp %>%
+  group_by(headline_id) %>%
+  summarise(
+    villain_present_rate = mean(villain_present_bin, na.rm = TRUE),
+    victim_present_rate  = mean(victim_present_bin, na.rm = TRUE),
+    # completion 
+    victim_named_rate  = mean(named_victim, na.rm = TRUE),
+    villain_named_rate = mean(named_villain, na.rm = TRUE),
+    # preserve source quality
+    pc1 = mean(pc1, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  )
+```
+
+```{r}
+# define categories
+head_data_comp = head_data_comp %>%
+  mutate(
+    dyad = case_when(
+      villain_present_rate >= 0.5 & victim_present_rate < 0.5 ~ "villain_only",
+      villain_present_rate < 0.5 & victim_present_rate >= 0.5 ~ "victim_only",
+      villain_present_rate >= 0.5 & victim_present_rate >= 0.5 ~ "dyad",
+      villain_present_rate < 0.5 & victim_present_rate < 0.5 ~ "neither",
+      TRUE ~ NA_character_
+    )
+  )
+```
+
+```{r}
+data_comp = head_data_comp %>%
+  # select on cases with only a victim or only a villain
+  filter(dyad %in% c("villain_only", "victim_only")) %>%
+  # calculate rates of a victim being named in a villain-only case and
+  # rates of a villain being named in a victim-only case
+  mutate(
+    completion_rate = case_when(
+      dyad == "villain_only" ~ victim_named_rate,
+      dyad == "victim_only"  ~ villain_named_rate
+    ),
+    completion_type = case_when(
+      dyad == "villain_only" ~ "Victim completion",
+      dyad == "victim_only"  ~ "Villain completion"
+    )
+  )
+```
+
+## Descriptives
+
+```{r}
+knitr::kable(data_comp %>%
+  group_by(completion_type) %>%
+  summarise(
+    mean_completion = mean(completion_rate, na.rm = TRUE),
+    sd_completion = sd(completion_rate, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  ), digits = 2)
+```
+
+## Analysis
+
+### t-Test
+
+```{r}
+t.test(
+  completion_rate ~ completion_type,
+  data = data_comp
+)
+```
+
+# Session Information
+
+```{r}
+sessionInfo()
+```

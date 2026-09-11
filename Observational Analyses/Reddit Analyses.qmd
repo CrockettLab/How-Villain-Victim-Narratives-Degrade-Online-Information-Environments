@@ -1,0 +1,268 @@
+---
+title: "Reddit Analyses"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-expand: 1
+    toc-title: Contents
+    toc-location: left
+editor: visual
+execute:
+  freeze: auto
+  echo: true
+  message: false
+  warning: false
+---
+
+# Load Libraries
+
+```{r}
+library(tidyverse)
+library(data.table)
+library(fixest)
+library(knitr)
+library(broom)
+library(scales)
+library(nnet)
+library(parameters)
+library(flextable)
+```
+
+# Load Data
+
+```{r}
+data = fread(
+  'reddit_data.csv',
+  select = cols_needed,
+  showProgress = TRUE)
+
+n_loaded = nrow(data)
+cat("Rows loaded:", format(n_loaded, big.mark = ","), "\n")
+```
+
+```{r}
+kable(head(data), digits = 2, format = "markdown")
+```
+
+# Prepare Data
+
+## Exclusions
+
+```{r}
+# exclude rows with missing classifications or missing domain quality scores
+n0 = nrow(data)
+data = data[!is.na(villain_pred) & !is.na(victim_pred) &
+              !is.na(pc1) & domain != "" & !is.na(domain)]
+cat("Dropped", format(n0 - nrow(data), big.mark = ","),
+    "rows (missing classification, pc1, or domain)\n")
+```
+
+```{r}
+# num_crossposts is unavailable for older submissions (Reddit added the
+# feature in 2017); treat missing as 0 for the summed measure
+data[, num_crossposts0 := fifelse(is.na(num_crossposts), 0, num_crossposts)]
+
+# Pushshift stores negative sentinel values (e.g., -1) when an engagement
+# field could not be retrieved
+neg_audit = data[, .(
+  score_neg      = sum(score < 0, na.rm = TRUE),
+  comments_neg   = sum(num_comments < 0, na.rm = TRUE),
+  crossposts_neg = sum(num_crossposts0 < 0, na.rm = TRUE)
+)]
+print(neg_audit)
+
+data[score < 0, score := NA]
+data[num_comments < 0, num_comments := NA]
+data[num_crossposts0 < 0, num_crossposts0 := NA]
+```
+
+## Code Year
+
+```{r}
+# parse year and exclude unparseable/out-of-range rows
+data[, year_int := suppressWarnings(as.integer(substr(created_dt, 1, 4)))]
+
+data = data[!is.na(year_int) & year_int >= 2005 & year_int <= 2024]
+data[, year := as.factor(year_int)]
+data[, c("created_dt", "year_int") := NULL]
+
+cat("Analytic N:", format(nrow(data), big.mark = ","),
+    "| domains:", format(uniqueN(data$domain), big.mark = ","), "\n")
+```
+
+## Calibrate Model Probabilities
+
+```{r}
+cal_villain = readRDS(
+  '/Users/km0353/Desktop/Scripts/Fine Tuning/villain_probability_calibration.rds'
+)
+cal_victim  = readRDS(
+  '/Users/km0353/Desktop/Scripts/Fine Tuning/victim_probability_calibration.rds'
+)
+
+eps = 1e-4
+data[, lp_villain := qlogis(pmin(pmax(villain_prob, eps), 1 - eps))]
+data[, lp_victim  := qlogis(pmin(pmax(victim_prob,  eps), 1 - eps))]
+
+data[, p_villain_cal := predict(cal_villain,
+                                newdata = data.frame(lp = lp_villain, pc1 = pc1),
+                                type = "response")]
+data[, p_victim_cal := predict(cal_victim,
+                               newdata = data.frame(lp = lp_victim, pc1 = pc1),
+                               type = "response")]
+```
+
+## Code Moral Agent Variable
+
+```{r}
+data[, `:=`(
+  villain_pred_cal = as.integer(p_villain_cal > 0.5),
+  victim_pred_cal  = as.integer(p_victim_cal > 0.5),
+  dyad_binary_cal  = as.integer(p_villain_cal > 0.5 & p_victim_cal > 0.5)
+)]
+data[, moral_agent_cal := fcase(
+  villain_pred_cal == 1 & victim_pred_cal == 1, "dyad",
+  villain_pred_cal == 1 & victim_pred_cal == 0, "villain_only",
+  villain_pred_cal == 0 & victim_pred_cal == 1, "victim_only",
+  default = "neither"
+)]
+data[, moral_agent_cal := factor(moral_agent_cal,
+                                 levels = c("neither", "dyad",
+                                            "villain_only", "victim_only"))]
+```
+
+## Code Engagement Variables
+
+```{r}
+# missingness audit
+sapply(data[, .(score, num_comments, num_crossposts)],
+       function(x) sum(is.na(x)))
+```
+
+```{r}
+data[, engagement := score + num_comments + num_crossposts0]
+
+# standardized index: z-score each metric, then sum 
+data[, eng_index := scale(score)[, 1] + scale(num_comments)[, 1] +
+                    scale(num_crossposts0)[, 1]]
+
+cat("Rows with complete engagement data:",
+    format(sum(!is.na(data$engagement)), big.mark = ","), "\n")
+```
+
+## Code Source Quality
+
+```{r}
+# reverse code source quality: 0 = highest quality, 1 = lowest
+data[, pc1_reversed := 1 - pc1]
+```
+
+# Descriptives
+
+```{r}
+desc = data[, .(
+  n = .N,
+  n_domains = uniqueN(domain),
+  villain_rate = mean(villain_pred_cal),
+  victim_rate = mean(victim_pred_cal),
+  dyad_rate = mean(dyad_binary_cal),
+  either_rate = mean(villain_pred_cal == 1 | victim_pred_cal == 1),
+  score_median = median(score),
+  comments_median = median(num_comments),
+  crossposts_median = median(num_crossposts0)
+)]
+kable(desc, digits = 4)
+
+agent_props = data[, .N, by = moral_agent_cal][, prop := N / sum(N)][]
+kable(agent_props, digits = 4)
+```
+
+# Analyses
+
+## Hypothesis 1
+
+```{r}
+h1_mod = multinom(
+  moral_agent_cal ~
+    pc1_reversed + year,
+  data = data
+)
+```
+
+```{r}
+h1_res_table = model_parameters(h1_mod, exponentiate = TRUE) %>% kable(digits = 3, format = "markdown")
+```
+
+```{r}
+h1_res_table
+```
+
+```{r}
+knitr::kable(
+avg_comparisons(h1_mod,
+                variables = list(pc1_reversed = c(0, 1))) %>%
+                  as_tibble(),
+digits = 2
+)
+```
+
+## Hypothesis 2
+
+```{r}
+h2_score      = fenegbin(score ~ moral_agent_cal, data = data)
+h2_comments   = fenegbin(num_comments ~ moral_agent_cal, data = data)
+h2_crossposts = fenegbin(num_crossposts0 ~ moral_agent_cal, data = data)
+h2_sum        = fenegbin(engagement ~ moral_agent_cal, data = data)
+h2_index      = feols(eng_index ~ moral_agent_cal, data = data)
+```
+
+```{r}
+h2_tbl = bind_rows(
+  tidy(h2_score, conf.int = TRUE) %>% mutate(outcome = "Score (NB)"),
+  tidy(h2_comments, conf.int = TRUE) %>% mutate(outcome = "Comments (NB)"),
+  tidy(h2_crossposts, conf.int = TRUE) %>% mutate(outcome = "Crossposts (NB)"),
+  tidy(h2_sum, conf.int = TRUE) %>% mutate(outcome = "Summed (NB)"),
+  tidy(h2_index, conf.int = TRUE) %>% mutate(outcome = "Z-index (OLS)")
+) %>%
+  filter(str_starts(term, "moral_agent_cal")) %>%
+  mutate(contrast = str_remove(term, "moral_agent_cal")) %>%
+  # exponentiate NB rows to IRRs; leave the OLS row on the raw scale
+  mutate(across(c(estimate, conf.low, conf.high),
+                ~ if_else(outcome == "Z-index (OLS)", .x, exp(.x)))) %>%
+  dplyr::select(outcome, contrast, estimate, conf.low, conf.high, statistic, p.value)
+
+kable(h2_tbl, digits = 4,
+      caption = "H2 Results")
+```
+
+```{r}
+predict_dyad_vs_neither = function(mod, platform, outcome,
+                                   term = "moral_agent_caldyad",
+                                   invlink = exp, file = NULL) {
+  b = coef(mod); V = vcov(mod)
+  stopifnot("(Intercept)" %in% names(b), term %in% names(b))
+  keep = c("(Intercept)", term)
+  L = rbind(Neither = c(1, 0), Dyad = c(1, 1))
+  eta = as.vector(L %*% b[keep])
+  se  = sqrt(diag(L %*% V[keep, keep] %*% t(L)))
+  out = tibble(platform = platform, outcome = outcome,
+               group = rownames(L),
+               predicted = invlink(eta),
+               conf.low  = invlink(eta - 1.96 * se),
+               conf.high = invlink(eta + 1.96 * se))
+  if (!is.null(file)) readr::write_csv(out, file)
+  out
+}
+```
+
+```{r}
+predict_dyad_vs_neither(h2_sum, "Reddit", "summed engagement",
+                        file = "pred_engagement_reddit.csv")
+```
+
+# Session Info
+
+```{r}
+sessionInfo()
+```

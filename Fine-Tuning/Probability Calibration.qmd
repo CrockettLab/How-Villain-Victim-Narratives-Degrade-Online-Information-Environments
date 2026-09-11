@@ -1,0 +1,213 @@
+---
+title: "Probability Calibration"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-expand: 1
+    toc-title: Contents
+    toc-location: left
+editor: visual
+execute:
+  freeze: auto
+  echo: true
+  message: false
+  warning: false
+---
+
+Fits source-quality-aware recalibrations of the fine-tuned villain and victim classifiers using the held-out annotated test split
+
+# Load Libraries
+
+```{r}
+library(tidyverse)
+library(knitr)
+library(broom)
+library(rsample)
+```
+
+# Reconstruct the Annotated Test Split
+
+```{r}
+# train-test split record
+manifest = read_csv(
+  'train_test_split_record.csv',
+  show_col_types = FALSE
+  )
+
+# headline-level annotations
+annotations = read_csv(
+  'headline_level_data.csv',
+  show_col_types = FALSE
+  )
+
+# raw model villain and victim probabilities
+villain_probs = read_csv(
+  'olmo32b_villain_qlora/test_probs.csv',
+  show_col_types = FALSE
+  )
+
+victim_probs  = read_csv(
+  'olmo32b_victim_qlora/test_probs.csv',
+  show_col_types = FALSE
+  )
+
+test_manifest = manifest %>% filter(split == "test")
+cat("Test split:", nrow(test_manifest), "headlines\n")
+```
+
+## Verify Row Alignment
+
+The test probability files do not contain ids, so bind by row order
+
+```{r}
+test_df = test_manifest %>%
+  mutate(
+    p_villain = villain_probs$prob_1,
+    y_villain_check = villain_probs$label,
+    p_victim = victim_probs$prob_1,
+    y_victim_check = victim_probs$label
+  )
+
+# labels recorded alongside the probabilities must match the manifest
+stopifnot(all(test_df$villain_presence_majority == test_df$y_villain_check))
+stopifnot(all(test_df$victim_presence_majority == test_df$y_victim_check))
+
+# the headline inside each prompt must match the manifest headline
+prompt_headline = str_match(villain_probs$prompt,
+                            'Here is the headline:\\n"(.*)"\\n')[, 2]
+clean = function(x) str_squish(str_replace_all(x, "\\n", " "))
+stopifnot(all(clean(prompt_headline) == clean(test_df$share_title)))
+
+cat("Alignment verified on", nrow(test_df), "rows\n")
+```
+
+## Attach Source Quality
+
+```{r}
+test_df = test_df %>%
+  left_join(annotations %>%
+              distinct(url_rid, pc1, villain_presence_sum, victim_presence_sum,
+                       villain_presence_count, victim_presence_count),
+            by = "url_rid")
+```
+
+# Calibration Function
+
+One function, applied to each task.
+
+```{r}
+eps = 1e-4
+
+fit_calibration = function(df, y_col, p_col, task_label, v_folds = 10) {
+  cal_df = df %>%
+    transmute(
+      y = as.integer(.data[[y_col]]),
+      p = pmin(pmax(as.numeric(.data[[p_col]]), eps), 1 - eps),
+      lp = qlogis(p),               # logit-scale predictor
+      pc1 = as.numeric(pc1)
+    ) %>%
+    filter(!is.na(y), !is.na(p), !is.na(pc1))
+
+  # cross-fit diagnostics: does calibration remove the error-pc1 slope?
+  set.seed(42)
+  folds = vfold_cv(cal_df, v = v_folds, strata = y)
+  cf = folds %>%
+    mutate(
+      fit = map(splits, ~ glm(y ~ lp * pc1, family = binomial(),
+                              data = analysis(.x))),
+      preds = map2(splits, fit, ~ assessment(.x) %>%
+                     mutate(p_cal = predict(.y, newdata = assessment(.x),
+                                            type = "response")))
+    ) %>%
+    pull(preds) %>%
+    bind_rows() %>%
+    mutate(err_raw = p - y, err_cal = p_cal - y)
+
+  slope_raw = tidy(lm(err_raw ~ pc1, data = cf)) %>% filter(term == "pc1")
+  slope_cal = tidy(lm(err_cal ~ pc1, data = cf)) %>% filter(term == "pc1")
+
+  diag_tbl = bind_rows(
+    slope_raw %>% mutate(model = "Raw"),
+    slope_cal %>% mutate(model = "Cross-fit calibrated")
+  ) %>% select(model, estimate, std.error, p.value)
+
+  diag_plot = cf %>%
+    select(pc1, err_raw, err_cal) %>%
+    pivot_longer(-pc1, names_to = "type", values_to = "err") %>%
+    mutate(type = recode(type, err_raw = "Raw error",
+                         err_cal = "Cross-fit calibrated error")) %>%
+    ggplot(aes(pc1, err)) +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    geom_smooth(method = "loess", span = 0.7, se = TRUE) +
+    facet_wrap(~type, ncol = 1) +
+    theme_classic() +
+    labs(x = "Source quality", y = "Error (p - y)", title = task_label)
+
+  # final model on ALL test-split rows
+  final_fit = glm(y ~ lp * pc1, family = binomial(), data = cal_df)
+
+  # bootstrap: stability of the calibration mapping
+  set.seed(42)
+  boot_curves = map_dfr(1:500, function(b) {
+    bs = cal_df[sample(nrow(cal_df), replace = TRUE), ]
+    fit = glm(y ~ lp * pc1, family = binomial(), data = bs)
+    expand_grid(p = c(0.1, 0.5, 0.9), pc1 = c(0.2, 0.5, 0.8)) %>%
+      mutate(lp = qlogis(p),
+             p_cal = predict(fit, newdata = cur_data(), type = "response"),
+             rep = b)
+  })
+  boot_tbl = boot_curves %>%
+    group_by(p, pc1) %>%
+    summarise(p_cal_med = median(p_cal),
+              p_cal_lo = quantile(p_cal, .025),
+              p_cal_hi = quantile(p_cal, .975), .groups = "drop")
+
+  list(fit = final_fit, diagnostics = diag_tbl, plot = diag_plot,
+       boot = boot_tbl, n = nrow(cal_df))
+}
+```
+
+# Villain Calibration
+
+```{r}
+cal_villain = fit_calibration(test_df, "villain_presence_majority",
+                              "p_villain", "Villain")
+cat("n =", cal_villain$n, "\n")
+kable(cal_villain$diagnostics, digits = 4)
+cal_villain$plot
+```
+
+```{r}
+kable(tidy(cal_villain$fit, conf.int = TRUE), digits = 3)
+kable(cal_villain$boot, digits = 3,
+      caption = "Bootstrap stability: calibrated probability at reference (p, pc1) points")
+```
+
+# Victim Calibration
+
+```{r}
+cal_victim = fit_calibration(test_df, "victim_presence_majority",
+                             "p_victim", "Victim")
+cat("n =", cal_victim$n, "\n")
+kable(cal_victim$diagnostics, digits = 4)
+cal_victim$plot
+```
+
+```{r}
+kable(tidy(cal_victim$fit, conf.int = TRUE), digits = 3)
+kable(cal_victim$boot, digits = 3)
+```
+
+# Save
+
+```{r}
+saveRDS(cal_villain$fit, "villain_probability_calibration.rds")
+saveRDS(cal_victim$fit,  "victim_probability_calibration.rds")
+```
+
+# Session Info
+
+```{r}
+sessionInfo()
+```
