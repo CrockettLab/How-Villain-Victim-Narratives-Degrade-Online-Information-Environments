@@ -1,0 +1,3 @@
+*.safetensors filter=lfs diff=lfs merge=lfs -text
+facebook_data.csv filter=lfs diff=lfs merge=lfs -text
+bluesky_data.csv filter=lfs diff=lfs merge=lfs -text
